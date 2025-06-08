@@ -129,7 +129,7 @@ void loop() {
     }
 
     if (bufferFilled) {
-      spO2 = calculateSpO2_ACDC(redBuffer, irBuffer, BUFFER_SIZE);
+      spO2 = calculateSpO2(redBuffer, irBuffer, BUFFER_SIZE);
     }
 
     spO2Buffer[bufferBpmIndex] = spO2;
@@ -249,15 +249,14 @@ int calculateGraphPositionModified(float bpm, long &SensorOffset) {
   return y;
 }
 
-float calculateSpO2_ACDC(int redBuffer[], int irBuffer[], int samples) {
-  long redDC = 0, irDC = 0;
-  int redMin = 1023, redMax = 0;
-  int irMin = 1023, irMax = 0;
+float calculateSpO2(int redBuffer[], int irBuffer[], int samples) {
+  long sumRedDC = 0, sumIrDC = 0;
+  long sumRedAC = 0, sumIrAC = 0;
+
+  int redMin = 0x7FFFFFFF, redMax = 0;
+  int irMin = 0x7FFFFFFF, irMax = 0;
 
   for (int i = 0; i < samples; i++) {
-    redDC += redBuffer[i];
-    irDC  += irBuffer[i];
-
     if (redBuffer[i] < redMin) redMin = redBuffer[i];
     if (redBuffer[i] > redMax) redMax = redBuffer[i];
 
@@ -265,18 +264,32 @@ float calculateSpO2_ACDC(int redBuffer[], int irBuffer[], int samples) {
     if (irBuffer[i] > irMax) irMax = irBuffer[i];
   }
 
-  float redAC = redMax - redMin;
-  float irAC  = irMax - irMin;
+  // Calcular AC como amplitude pico a pico
+  int redAC = redMax - redMin;
+  int irAC = irMax - irMin;
 
-  float redDCavg = (float)redDC / samples;
-  float irDCavg  = (float)irDC  / samples;
+  // Calcular DC como média (para cada canal)
+  for (int i = 0; i < samples; i++) {
+    sumRedDC += redBuffer[i];
+    sumIrDC += irBuffer[i];
+  }
+
+  float redDCavg = (float)sumRedDC / samples;
+  float irDCavg = (float)sumIrDC / samples;
 
   if (redDCavg == 0 || irDCavg == 0 || irAC == 0) return 0;
 
-  float R = (redAC / redDCavg) / (irAC / irDCavg);
-  float spo2 = 110.0 - 25.0 * R;
+  // R = (AC_RED/DC_RED) / (AC_IR/DC_IR)
+  float R = ((float)redAC / redDCavg) / ((float)irAC / irDCavg);
 
-  return constrain(spo2, 0.0, 100.0);
+  // fórmula empírica para SpO2
+  float SpO2 = 110 - 25 * R;
+
+  // Limitar valores possíveis
+  if (SpO2 > 100) SpO2 = 100;
+  if (SpO2 < 0) SpO2 = 0;
+
+  return SpO2;
 }
 
 float averageBuffer(float buffer[], int size, bool filled) {
