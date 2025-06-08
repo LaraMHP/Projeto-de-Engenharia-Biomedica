@@ -1,0 +1,291 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+
+#define TFT_CS    5
+#define TFT_RST   4
+#define TFT_DC    2
+#define TFT_SDA   23
+#define TFT_SCL   18
+
+#define MAX_SDA   21
+#define MAX_SCL   22
+
+#define SCALING 12
+#define TRACE_SPEED 0.5
+#define TRACE_MIDDLE_Y_POSITION 90
+#define TRACE_HEIGHT 60
+#define HALF_TRACE_HEIGHT (TRACE_HEIGHT / 2)
+#define TRACE_MIN_Y (TRACE_MIDDLE_Y_POSITION - HALF_TRACE_HEIGHT + 1)
+#define TRACE_MAX_Y (TRACE_MIDDLE_Y_POSITION + HALF_TRACE_HEIGHT - 1)
+
+#define BUFFER_SIZE 100
+#define BUFFER_BPM_SIZE 10
+
+MAX30105 particleSensor;
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+
+long lastBeatTime = 0;
+float bpm = 0.0;
+float bpmFiltered = 0.0;
+const float alphaBPM = 0.3;
+
+const long MIN_IR_VALUE = 5000;
+#define BPM_MIN_INTERVAL 300
+#define BPM_MAX_INTERVAL 2000
+
+float irEMA = 0.0;
+const float alphaEMA = 0.1;
+
+long SensorOffset = 10000;
+
+// Detecção de pico robusta
+bool isPeakDetected = false;
+long lastIR = 0;
+long prevIR = 0;
+long prevPrevIR = 0;
+long lastPeakTime = 0;
+
+// Buffers para AC/DC SpO2
+int redBuffer[BUFFER_SIZE];
+int irBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+bool bufferFilled = false;
+
+// Buffers circulares para BPM e SpO2
+float bpmBuffer[BUFFER_BPM_SIZE];
+float spO2Buffer[BUFFER_BPM_SIZE];
+int bufferBpmIndex = 0;
+bool bpmBufferFilled = false;
+
+float spO2 = 0.0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Inicializando...");
+
+  Wire.begin(MAX_SDA, MAX_SCL);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 não encontrado.");
+    while (1);
+  }
+
+  particleSensor.setup(0x1F, 8, 3, 100, 411, 4096);
+  particleSensor.enableDIETEMPRDY();
+
+  tft.initR(INITR_GREENTAB);
+  tft.setRotation(3);
+  tft.fillScreen(ST7735_BLACK);
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST7735_WHITE);
+  tft.setCursor(1, 0);
+  tft.print("Monitoramento vital");
+
+  tft.setTextSize(2);
+  tft.setCursor(0, 10);
+  tft.print("BPM:");
+
+  tft.drawRect(0, TRACE_MIN_Y - 1, 160, TRACE_HEIGHT + 2, ST7735_BLUE);
+}
+
+void loop() {
+  static int lastx = 1;
+  static int lasty = TRACE_MIDDLE_Y_POSITION;
+  static float x = 1.0;
+
+  long irValue = particleSensor.getIR();
+  long redValue = particleSensor.getRed();
+
+  // Filtro EMA para detectar dedo
+  if (irEMA == 0.0) {
+    irEMA = (float)irValue;
+  } else {
+    irEMA = alphaEMA * irValue + (1.0 - alphaEMA) * irEMA;
+  }
+
+  bool fingerDetected = (irEMA > MIN_IR_VALUE);
+
+  // Limpa área do display
+  tft.fillRect(0, 20, 160, 40, ST7735_BLACK);
+  tft.drawRect(0, TRACE_MIN_Y - 1, 160, TRACE_HEIGHT + 2, ST7735_BLUE);
+
+  if (fingerDetected) {
+    detectPeak(irValue);
+
+    // Armazena no buffer de BPM
+    bpmBuffer[bufferBpmIndex] = bpmFiltered;
+
+    // Armazena sinais para SpO2
+    redBuffer[bufferIndex] = redValue;
+    irBuffer[bufferIndex] = irValue;
+
+    bufferIndex++;
+    if (bufferIndex >= BUFFER_SIZE) {
+      bufferIndex = 0;
+      bufferFilled = true;
+    }
+
+    if (bufferFilled) {
+      spO2 = calculateSpO2_ACDC(redBuffer, irBuffer, BUFFER_SIZE);
+    }
+
+    spO2Buffer[bufferBpmIndex] = spO2;
+
+    bufferBpmIndex++;
+    if (bufferBpmIndex >= BUFFER_BPM_SIZE) {
+      bufferBpmIndex = 0;
+      bpmBufferFilled = true;
+    }
+
+    // Cálculo das médias
+    float avgBPM = averageBuffer(bpmBuffer, BUFFER_BPM_SIZE, bpmBufferFilled);
+    float avgSpO2 = averageBuffer(spO2Buffer, BUFFER_BPM_SIZE, bpmBufferFilled);
+
+    // Exibe BPM médio
+    tft.setCursor(0, 30);
+    tft.setTextSize(2);
+    tft.setTextColor((avgBPM < 60 || avgBPM > 110) ? ST7735_BLUE : ST7735_GREEN);
+    if (avgBPM > 0)
+      tft.print((int)avgBPM);
+    else
+      tft.print("--");
+
+    // Exibe SpO2 médio
+    tft.setTextSize(1);
+    tft.setCursor(90, 20);
+    tft.setTextColor(ST7735_MAGENTA);
+    tft.print("SpO2:");
+    tft.print(avgSpO2, 1);
+    tft.print(" %");
+
+  } else {
+    // Sem dedo
+    tft.setCursor(0, 30);
+    tft.setTextSize(2);
+    tft.setTextColor(ST7735_RED);
+    tft.print("SEM DEDO");
+
+    bpmFiltered = 0;
+    isPeakDetected = false;
+    lastPeakTime = 0;
+    bufferIndex = 0;
+    bufferBpmIndex = 0;
+    bufferFilled = false;
+    bpmBufferFilled = false;
+  }
+
+  // Gráfico
+  int y = calculateGraphPositionModified(bpmFiltered, SensorOffset);
+  tft.drawLine(lastx, lasty, (int)x, y, ST7735_YELLOW);
+  lasty = y;
+  lastx = (int)x;
+  x += TRACE_SPEED;
+
+  if (x > 158) {
+    tft.fillRect(1, TRACE_MIN_Y, 158, TRACE_HEIGHT, ST7735_BLACK);
+    x = 1;
+    lastx = (int)x;
+  }
+
+  // Atualiza histórico IR
+  prevPrevIR = prevIR;
+  prevIR = lastIR;
+  lastIR = irValue;
+
+  delay(10);
+}
+
+void detectPeak(long irValue) {
+  long now = millis();
+
+  float lastBpmFilter=0.0;
+
+  if (prevIR > prevPrevIR && prevIR > irValue && prevIR > MIN_IR_VALUE) {
+    long timeSinceLastPeak = now - lastPeakTime;
+
+    if (timeSinceLastPeak >= BPM_MIN_INTERVAL && timeSinceLastPeak <= BPM_MAX_INTERVAL) {
+      bpm = 60.0 / (timeSinceLastPeak / 1000.0);
+      if (bpmFiltered == 0.0)
+      {
+        bpmFiltered = bpm;
+        lastBpmFilter=bpm;
+      }
+      else{
+        lastBpmFilter=bpmFiltered;
+        bpmFiltered = alphaBPM * bpm + (1.0 - alphaBPM) * bpmFiltered;
+      }
+        
+      Serial.print("BPM bruto: ");
+      Serial.print(bpm);
+      Serial.print(" → BPM filtrado: ");
+      Serial.println(bpmFiltered);
+
+      lastPeakTime = now;
+    } else if (timeSinceLastPeak > BPM_MAX_INTERVAL) {
+      bpmFiltered = lastBpmFilter;
+      lastPeakTime = now;
+    }
+  }
+}
+
+int calculateGraphPositionModified(float bpm, long &SensorOffset) {
+  if (bpm > 200) bpm = 200;
+  if (bpm < 0) bpm = 0;
+
+  int y = TRACE_MIN_Y + TRACE_HEIGHT - (int)((bpm / 200.0) * TRACE_HEIGHT);
+
+  int32_t Diff = y - SensorOffset;
+  Diff /= SCALING;
+
+  if (Diff < -HALF_TRACE_HEIGHT)
+    SensorOffset += (SCALING * (abs(Diff) - HALF_TRACE_HEIGHT));
+  if (Diff > HALF_TRACE_HEIGHT)
+    SensorOffset += (SCALING * (abs(Diff) - HALF_TRACE_HEIGHT));
+
+  y = constrain(y, TRACE_MIN_Y, TRACE_MAX_Y);
+  return y;
+}
+
+float calculateSpO2_ACDC(int redBuffer[], int irBuffer[], int samples) {
+  long redDC = 0, irDC = 0;
+  int redMin = 1023, redMax = 0;
+  int irMin = 1023, irMax = 0;
+
+  for (int i = 0; i < samples; i++) {
+    redDC += redBuffer[i];
+    irDC  += irBuffer[i];
+
+    if (redBuffer[i] < redMin) redMin = redBuffer[i];
+    if (redBuffer[i] > redMax) redMax = redBuffer[i];
+
+    if (irBuffer[i] < irMin) irMin = irBuffer[i];
+    if (irBuffer[i] > irMax) irMax = irBuffer[i];
+  }
+
+  float redAC = redMax - redMin;
+  float irAC  = irMax - irMin;
+
+  float redDCavg = (float)redDC / samples;
+  float irDCavg  = (float)irDC  / samples;
+
+  if (redDCavg == 0 || irDCavg == 0 || irAC == 0) return 0;
+
+  float R = (redAC / redDCavg) / (irAC / irDCavg);
+  float spo2 = 110.0 - 25.0 * R;
+
+  return constrain(spo2, 0.0, 100.0);
+}
+
+float averageBuffer(float buffer[], int size, bool filled) {
+  float sum = 0;
+  int count = filled ? size : bufferBpmIndex;
+  if (count == 0) return 0;
+
+  for (int i = 0; i < count; i++) {
+    sum += buffer[i];
+  }
+  return sum / count;
+}
