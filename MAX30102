@@ -283,7 +283,7 @@ float calculateSpO2(int redBuffer[], int irBuffer[], int samples) {
   float R = ((float)redAC / redDCavg) / ((float)irAC / irDCavg);
 
   // fórmula empírica para SpO2
-  float SpO2 = 110 - 25 * R;
+  float SpO2 = 110 - (25 * R);
 
   // Limitar valores possíveis
   if (SpO2 > 100) SpO2 = 100;
